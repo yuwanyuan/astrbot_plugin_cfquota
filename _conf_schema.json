@@ -1,0 +1,34 @@
+{
+  "accounts": {
+    "description": "Cloudflare 账号列表（支持多账号）",
+    "type": "template_list",
+    "templates": {
+      "cloudflare": {
+        "name": "Cloudflare 账号",
+        "hint": "添加一个 Cloudflare 账号用于查询 Workers 额度",
+        "items": {
+          "name": {
+            "description": "账号别名（用于区分多个账号，如：主账号、工作账号）",
+            "type": "string",
+            "hint": "在命令中使用此别名来指定账号"
+          },
+          "account_id": {
+            "description": "Cloudflare Account ID",
+            "type": "string",
+            "hint": "在 Cloudflare Dashboard 右侧 API 区域查看"
+          },
+          "api_token": {
+            "description": "Cloudflare API Token",
+            "type": "string",
+            "hint": "访问 https://dash.cloudflare.com/profile/api-tokens 创建，需要 Workers Scripts Read 权限"
+          }
+        }
+      }
+    }
+  },
+  "default_account": {
+    "description": "默认查询的账号别名（留空则查询第一个账号）",
+    "type": "string",
+    "hint": "与账号列表中的别名对应"
+  }
+}
