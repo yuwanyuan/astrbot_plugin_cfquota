@@ -1,0 +1,6 @@
+name: astrbot_plugin_cfquota
+display_name: CF Workers 额度查询
+desc: 查询 Cloudflare Workers 计算额度使用情况，支持多账号管理
+version: v1.0.0
+author: yuwanyuan
+repo: https://github.com/yuwanyuan/astrbot_plugin_cfquota
