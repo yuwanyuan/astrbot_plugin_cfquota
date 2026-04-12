@@ -1,6 +1,19 @@
+<div align="center">
+
+![:name](https://count.getloli.com/@astrbot_plugin_cfquota?name=astrbot_plugin_cfquota&theme=minecraft&padding=6&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
+
 # astrbot_plugin_cfquota
 
-> AstrBot 插件 — 查询 Cloudflare Workers 计算额度使用情况，支持多账号管理和定时推送
+_📊 Cloudflare Workers 额度查询插件（AstrBot） 📊_
+
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![AstrBot](https://img.shields.io/badge/AstrBot-4.9.2%2B-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+
+</div>
+
+> AstrBot 插件 — 查询 Cloudflare Workers 计算额度使用情况，支持多账号管理、后台数据采集和定时推送
 
 ## ✨ 功能
 
@@ -8,8 +21,9 @@
 - 👥 支持添加多个 Cloudflare 账号
 - ⭐ 支持设置默认账号
 - 🔍 添加账号时自动验证有效性
-- ⏰ 定时推送额度信息（支持自定义时间和账号）
-- 📡 立即推送功能
+- ⏱ 后台数据采集（每 30/60 分钟从 CF API 拉取数据并缓存）
+- ⏰ 定时推送缓存数据（自定义整点时间，推送即时无延迟）
+- 📡 手动采集和立即推送功能
 - 🤖 通过 AstrBot 跨平台使用（QQ / Telegram / 飞书 / 钉钉 / Slack 等）
 
 ## 📦 安装
@@ -59,16 +73,18 @@
 | `/cfdel 名称` | 删除指定账号 | `/cfdel 主账号` |
 | `/cfdefault 名称` | 设置默认账号 | `/cfdefault 主账号` |
 
-### 定时推送
+### 用量监控
 
 | 命令 | 说明 | 示例 |
 |------|------|------|
-| `/cfpush status` | 查看推送状态 | `/cfpush` |
-| `/cfpush on [小时...]` | 开启推送（默认 8 20） | `/cfpush on 8 20` |
-| `/cfpush off` | 关闭推送 | `/cfpush off` |
+| `/cfpush status` | 查看监控状态 | `/cfpush` |
+| `/cfpush on [小时...]` | 开启监控（默认 8 20） | `/cfpush on 8 20` |
+| `/cfpush off` | 关闭监控 | `/cfpush off` |
+| `/cfpush interval 30\|60` | 数据采集间隔（分钟） | `/cfpush interval 30` |
 | `/cfpush hours 小时...` | 修改推送时间 | `/cfpush hours 9 18 21` |
-| `/cfpush accounts 名称...` | 指定推送账号 | `/cfpush accounts 主账号` |
-| `/cfpush now` | 立即推送一次 | `/cfpush now` |
+| `/cfpush accounts 名称...` | 指定监控账号 | `/cfpush accounts 主账号` |
+| `/cfpush now` | 采集并立即推送一次 | `/cfpush now` |
+| `/cfpush fetch` | 手动触发一次数据采集 | `/cfpush fetch` |
 | `/cfhelp` | 显示帮助信息 | `/cfhelp` |
 
 ## 🔑 获取 Cloudflare 凭证
@@ -103,6 +119,7 @@
 机器人: 📊 Cloudflare Workers 额度查询
 
        🏢 账户: My Cloudflare Account（主账号）
+       🕐 数据时间: 2026-04-13 08:30:00
 
        ⚡ 今日请求次数:
          已用: 12,345
@@ -112,29 +129,63 @@
        ⏱ CPU 时间: 10ms/请求（免费版）
 ```
 
-### 开启定时推送
+### 开启用量监控
 ```
 用户: /cfpush on 8 20
-机器人: ✅ 定时推送已开启！
+机器人: ✅ 用量监控已开启！
 
+         ⏱ 数据采集: 每 60 分钟
          ⏰ 推送时间: 08:00, 20:00
-         📊 推送账号: 全部账号
+         📊 监控账号: 全部账号
          🎯 推送目标: 当前会话
+```
+
+### 修改采集间隔
+```
+用户: /cfpush interval 30
+机器人: ✅ 数据采集间隔已更新: 每 30 分钟
+```
+
+### 手动采集数据
+```
+用户: /cfpush fetch
+机器人: ✅ 数据采集完成，已缓存 2 个账号的数据
+         • 主账号: 采集于 2026-04-13 08:30:00
+         • 备用账号: 采集于 2026-04-13 08:30:05
 ```
 
 ### 立即推送
 ```
 用户: /cfpush now
-机器人: 🔍 正在查询额度...
-       （随后收到推送消息）
+       （先自动采集数据，再推送缓存结果）
 ```
 
-## ⏰ 定时推送原理
+## 📡 用量监控架构
 
-1. 插件启动时注册一个后台异步任务，每 60 秒检查一次
-2. 到达指定整点时间时，自动查询所有（或指定）账号的额度
-3. 通过 `self.context.send_message()` 主动推送到绑定的会话
-4. 使用 KV 存储防止同一小时重复推送
+```
+┌──────────────────────────────────────────────┐
+│              插件启动                          │
+│                                               │
+│  ┌─────────────────┐  ┌─────────────────────┐ │
+│  │   数据采集循环    │  │    推送循环          │ │
+│  │                  │  │                     │ │
+│  │  每 30/60 分钟    │  │  每 60 秒检查        │ │
+│  │       ↓          │  │       ↓             │ │
+│  │  调用 CF API     │  │  当前时间 == 整点?    │ │
+│  │       ↓          │  │    ↓         ↓      │ │
+│  │  写入内存缓存     │  │   Yes       No      │ │
+│  │  _usage_cache    │  │    ↓         ↓      │ │
+│  │                  │  │  推送缓存   等待      │ │
+│  └─────────────────┘  │  数据到会话           │ │
+│                        └─────────────────────┘ │
+└──────────────────────────────────────────────┘
+```
+
+**优势**：
+- 📤 **推送即时**：推送时使用缓存数据，无需等待 API 响应
+- 🔄 **数据新鲜**：采集间隔可配置 30/60 分钟，数据始终保持更新
+- 🛡️ **容错降级**：API 临时故障时仍可推送最近的缓存数据
+- ⚡ **手动查询优先使用缓存**：`/cf额度` 命令优先返回缓存数据，缓存过期才实时查询
 
 **推送配置持久化**：推送设置保存在 KV 存储中，重启 AstrBot 后自动恢复。
 
@@ -162,6 +213,7 @@ astrbot_plugin_cfquota/
 - 免费版 Workers 的限额：每天 100,000 请求、每次 10ms CPU 时间
 - KV 存储中的账号数据仅保存在本地，不会上传
 - 定时推送的精度为 ±1 分钟，非精确到秒
+- 数据采集间隔建议 60 分钟（30 分钟更实时但 API 调用更频繁）
 
 ## 📜 许可证
 
