@@ -2,6 +2,10 @@
 AstrBot 插件：CF Workers 额度查询
 查询 Cloudflare Workers 计算额度使用情况，支持多账号管理和定时推送
 
+架构：
+  - 数据采集层：每 30/60 分钟从 CF API 拉取用量数据，缓存到内存
+  - 推送层：在用户自定义的整点时间，推送缓存数据（快速、可靠）
+
 命令列表：
   /cf额度 [账号别名]   - 查询 Workers 额度（不指定则查询默认账号）
   /cfadd 名称 AccountID ApiToken  - 添加 Cloudflare 账号
@@ -15,7 +19,7 @@ AstrBot 插件：CF Workers 额度查询
 import asyncio
 import aiohttp
 import logging
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, timezone
 from astrbot.api.star import Context, Star, register
 from astrbot.api import filter
 from astrbot.api.event import AstrMessageEvent, MessageChain
@@ -180,12 +184,6 @@ async def cf_get_workers_analytics(api_token: str, account_id: str, session: aio
     }
 
 
-def _today_str() -> str:
-    """返回今天的日期字符串 YYYY-MM-DD"""
-    from datetime import date
-    return date.today().isoformat()
-
-
 async def cf_validate_account(api_token: str, account_id: str) -> tuple:
     """验证账号是否有效，返回 (valid: bool, account_name_or_error: str)
     
@@ -221,13 +219,20 @@ def _safe_mask_id(account_id: str) -> str:
     return account_id[:8] + "..." + account_id[-4:]
 
 
-def format_quota_text(account_name: str, account_alias: str, usage_data: dict) -> str:
-    """格式化额度查询结果为文本"""
+def format_quota_text(account_name: str, account_alias: str, usage_data: dict, cache_time: str = "") -> str:
+    """格式化额度查询结果为文本
+    
+    Args:
+        cache_time: 缓存时间字符串，为空表示实时查询
+    """
     lines = [
         "📊 Cloudflare Workers 额度查询",
         "",
         f"🏢 账户: {account_name}（{account_alias}）",
     ]
+
+    if cache_time:
+        lines.append(f"🕐 数据时间: {cache_time}")
 
     if usage_data.get("source") == "unavailable":
         lines.extend([
@@ -332,16 +337,17 @@ def format_accounts_list(accounts: list, default_name: str = "") -> str:
     return "\n".join(lines)
 
 
-# ============ 定时推送相关 ============
+# ============ 用量监控相关 ============
 
-# 支持的推送时间点（整点）
-VALID_PUSH_HOURS = list(range(0, 24))
+# 支持的数据采集间隔（分钟）
+VALID_FETCH_INTERVALS = [30, 60]
 
 def format_push_status(push_config: dict) -> str:
-    """格式化定时推送状态"""
+    """格式化用量监控 + 定时推送状态"""
     if not push_config.get("enabled"):
-        return "📡 定时推送: 未开启"
+        return "📡 用量监控: 未开启"
 
+    fetch_interval = push_config.get("fetch_interval", 60)
     hours = push_config.get("hours", [])
     accounts = push_config.get("accounts", [])  # 空=全部
     umo = push_config.get("umo", "")
@@ -351,9 +357,10 @@ def format_push_status(push_config: dict) -> str:
     target_info = f"会话 {umo[:20]}..." if umo else "未绑定会话"
 
     return (
-        f"📡 定时推送: ✅ 已开启\n\n"
+        f"📡 用量监控: ✅ 已开启\n\n"
+        f"  ⏱ 数据采集: 每 {fetch_interval} 分钟\n"
         f"  ⏰ 推送时间: {', '.join(hour_strs)}\n"
-        f"  📊 推送账号: {account_str}\n"
+        f"  📊 监控账号: {account_str}\n"
         f"  🎯 推送目标: {target_info}"
     )
 
@@ -364,7 +371,12 @@ def format_push_status(push_config: dict) -> str:
 class CFQuotaPlugin(Star):
     """
     Cloudflare Workers 额度查询插件
-    支持多账号管理和定时推送
+    支持多账号管理、后台数据采集和定时推送
+    
+    架构：
+    - 采集循环：每 30/60 分钟从 CF API 拉取数据 → 缓存到 _usage_cache
+    - 推送循环：每 60 秒检查，到达整点时推送缓存数据
+    - 手动查询：优先使用缓存，缓存过期则实时查询
     """
 
     def __init__(self, context: Context):
@@ -374,21 +386,122 @@ class CFQuotaPlugin(Star):
         self._default_account: str = ""
         self._load_config()
 
-        # 定时推送配置
+        # 用量监控 + 推送配置
         self._push_config: dict = {
             "enabled": False,
-            "hours": [],        # 推送时间（小时列表，如 [8, 20]）
-            "accounts": [],     # 推送哪些账号（空=全部）
-            "umo": "",          # 推送目标会话
+            "fetch_interval": 60,   # 数据采集间隔（分钟），30 或 60
+            "hours": [],            # 推送时间（小时列表，如 [8, 20]）
+            "accounts": [],         # 监控哪些账号（空=全部）
+            "umo": "",              # 推送目标会话
         }
 
-        # 启动后台定时推送任务
+        # 用量数据缓存: { 账号别名: {"usage": dict, "account_name": str, "fetched_at": str} }
+        self._usage_cache: dict = {}
+
+        # 启动后台任务
+        self._fetch_task = asyncio.create_task(self._fetch_loop())
         self._push_task = asyncio.create_task(self._push_loop())
 
-    async def _push_loop(self):
-        """后台定时推送循环"""
+    # ============ 数据采集循环 ============
+
+    async def _fetch_loop(self):
+        """后台数据采集循环：每隔 fetch_interval 分钟从 CF API 拉取数据
+        
+        监控开启时：按用户设置的间隔（30/60分钟）采集
+        监控关闭时：每 2 小时采集一次（保证手动查询有可用缓存）
+        """
         # 先等一小段时间，让插件完全初始化
-        await asyncio.sleep(10)
+        await asyncio.sleep(15)
+
+        while True:
+            try:
+                # 从 KV 加载最新配置
+                await self._load_push_config()
+                await self._load_accounts_from_kv()
+
+                if self._push_config.get("enabled"):
+                    # 监控开启：按配置的间隔采集
+                    interval = self._push_config.get("fetch_interval", 60)
+                    if interval not in VALID_FETCH_INTERVALS:
+                        interval = 60
+                    await self._fetch_all_usage()
+                    await asyncio.sleep(interval * 60)
+                else:
+                    # 监控关闭：每 2 小时采集一次（保证手动查询有缓存）
+                    await self._fetch_all_usage()
+                    await asyncio.sleep(120 * 60)
+
+            except asyncio.CancelledError:
+                logger.info("CFQuotaPlugin fetch loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Fetch loop error: {e}")
+                await asyncio.sleep(60)
+
+    async def _fetch_all_usage(self):
+        """采集所有账号的用量数据"""
+        if not self._accounts:
+            return
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"Fetching usage data for {len(self._accounts)} account(s)...")
+
+        for acc in self._accounts:
+            alias = acc.get("name", "未命名")
+            api_token = acc.get("api_token", "")
+            account_id = acc.get("account_id", "")
+
+            if not api_token or not account_id:
+                continue
+
+            try:
+                usage = await cf_get_workers_usage(api_token, account_id)
+                # 尝试获取账户名
+                account_name = acc.get("account_name", "未知")
+                name_updated = False
+                try:
+                    info = await cf_get_account_info(api_token, account_id)
+                    account_name = info.get("name", account_name)
+                    # 更新账号中的账户名
+                    acc["account_name"] = account_name
+                    name_updated = True
+                except Exception:
+                    pass
+
+                self._usage_cache[alias] = {
+                    "usage": usage,
+                    "account_name": account_name,
+                    "fetched_at": now_str,
+                    "fetch_error": None,  # 清除旧的错误标记
+                }
+                logger.debug(f"Fetched usage for {alias}")
+
+                # 如果账户名有更新，保存到 KV
+                if name_updated:
+                    await self._save_accounts()
+
+            except Exception as e:
+                logger.error(f"Failed to fetch usage for {alias}: {e}")
+                if alias in self._usage_cache:
+                    # 保留旧的缓存数据，标记为采集失败
+                    self._usage_cache[alias]["fetch_error"] = str(e)
+                else:
+                    # 首次采集就失败，也要创建缓存条目，否则推送和查询无法正确处理
+                    self._usage_cache[alias] = {
+                        "usage": None,
+                        "account_name": acc.get("account_name", "未知"),
+                        "fetched_at": now_str,
+                        "fetch_error": str(e),
+                    }
+
+        logger.info(f"Usage data fetch completed, cached {len(self._usage_cache)} account(s)")
+
+    # ============ 推送循环 ============
+
+    async def _push_loop(self):
+        """后台推送循环：每 60 秒检查，到达整点时推送缓存数据"""
+        # 先等一小段时间，让首次数据采集完成
+        await asyncio.sleep(20)
 
         while True:
             try:
@@ -411,7 +524,7 @@ class CFQuotaPlugin(Star):
                         if last_push != today_str:
                             # 标记已推送
                             await self.context.put_kv_data(last_push_key, today_str)
-                            # 执行推送
+                            # 执行推送（使用缓存数据）
                             await self._do_push()
 
                 # 每 60 秒检查一次
@@ -425,7 +538,7 @@ class CFQuotaPlugin(Star):
                 await asyncio.sleep(60)
 
     async def _do_push(self):
-        """执行一次定时推送"""
+        """执行一次定时推送（使用缓存数据）"""
         push_config = self._push_config
         umo = push_config.get("umo", "")
         if not umo:
@@ -453,30 +566,47 @@ class CFQuotaPlugin(Star):
             logger.warning("No matching accounts for push")
             return
 
-        # 逐个查询并推送
+        # 逐个格式化推送（优先使用缓存）
         all_results = []
         for acc in accounts_to_push:
             alias = acc.get("name", "未命名")
-            api_token = acc.get("api_token", "")
-            account_id = acc.get("account_id", "")
             account_name = acc.get("account_name", "未知")
 
-            if not api_token or not account_id:
-                all_results.append(f"⚠️ {alias}: 配置不完整")
-                continue
-
-            try:
-                usage = await cf_get_workers_usage(api_token, account_id)
-                # 尝试获取账户名
-                try:
-                    info = await cf_get_account_info(api_token, account_id)
-                    account_name = info.get("name", account_name)
-                except Exception:
-                    pass
-                result = format_quota_text(account_name, alias, usage)
+            cached = self._usage_cache.get(alias)
+            if cached and cached.get("usage"):
+                # 使用缓存数据
+                result = format_quota_text(
+                    cached.get("account_name", account_name),
+                    alias,
+                    cached["usage"],
+                    cache_time=cached.get("fetched_at", ""),
+                )
+                # 如果采集时出错，附加提示
+                if cached.get("fetch_error"):
+                    result += f"\n\n⚠️ 上次采集出错: {cached['fetch_error']}"
                 all_results.append(result)
-            except Exception as e:
-                all_results.append(f"❌ {alias}: 查询失败 - {str(e)}")
+            elif cached and cached.get("fetch_error"):
+                # 缓存存在但采集失败，优先显示错误而不是再实时查询
+                all_results.append(f"❌ {alias}: 上次采集失败 - {cached['fetch_error']}")
+            else:
+                # 缓存无数据，实时查询（降级方案）
+                api_token = acc.get("api_token", "")
+                account_id = acc.get("account_id", "")
+                if not api_token or not account_id:
+                    all_results.append(f"⚠️ {alias}: 配置不完整")
+                    continue
+
+                try:
+                    usage = await cf_get_workers_usage(api_token, account_id)
+                    try:
+                        info = await cf_get_account_info(api_token, account_id)
+                        account_name = info.get("name", account_name)
+                    except Exception:
+                        pass
+                    result = format_quota_text(account_name, alias, usage)
+                    all_results.append(result)
+                except Exception as e:
+                    all_results.append(f"❌ {alias}: 查询失败 - {str(e)}")
 
         if not all_results:
             return
@@ -600,24 +730,47 @@ class CFQuotaPlugin(Star):
             yield event.plain_result(f"❌ 账号「{alias_name}」配置不完整，缺少 API Token 或 Account ID")
             return
 
-        try:
-            # 获取使用量（GraphQL）
-            usage = await cf_get_workers_usage(api_token, account_id)
+        # 优先使用缓存数据
+        cached = self._usage_cache.get(alias_name)
+        if cached and cached.get("usage"):
+            # 检查缓存是否是今天的数据
+            fetched_at = cached.get("fetched_at", "")
+            is_stale = False
+            if fetched_at:
+                try:
+                    fetched_date = fetched_at.split(" ")[0]
+                    today_date = datetime.now().strftime("%Y-%m-%d")
+                    is_stale = fetched_date != today_date
+                except Exception:
+                    pass
 
-            # 获取账户名（尝试 Account Info，失败则用 KV 中缓存的名称）
-            account_name = account.get("account_name", "未知")
-            try:
-                info = await cf_get_account_info(api_token, account_id)
-                account_name = info.get("name", account_name)
-            except Exception:
-                pass  # Account Info 权限不足时使用缓存的名称
-
-            result = format_quota_text(account_name, alias_name, usage)
+            result = format_quota_text(
+                cached.get("account_name", account_name),
+                alias_name,
+                cached["usage"],
+                cache_time=fetched_at,
+            )
+            if is_stale:
+                result += "\n\n⚠️ 缓存数据非今日，建议使用 /cfpush fetch 重新采集"
             yield event.plain_result(result)
+        else:
+            # 缓存无数据，实时查询
+            try:
+                usage = await cf_get_workers_usage(api_token, account_id)
 
-        except Exception as e:
-            logger.error(f"Failed to query quota for {alias_name}: {e}")
-            yield event.plain_result(f"❌ 查询失败: {str(e)}")
+                # 获取账户名
+                try:
+                    info = await cf_get_account_info(api_token, account_id)
+                    account_name = info.get("name", account_name)
+                except Exception:
+                    pass
+
+                result = format_quota_text(account_name, alias_name, usage)
+                yield event.plain_result(result)
+
+            except Exception as e:
+                logger.error(f"Failed to query quota for {alias_name}: {e}")
+                yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
     @filter.command("/cfadd")
     async def add_account(self, event: AstrMessageEvent):
@@ -705,6 +858,9 @@ class CFQuotaPlugin(Star):
         if self._default_account == name:
             self._default_account = self._accounts[0].get("name", "") if self._accounts else ""
 
+        # 同时清除缓存
+        self._usage_cache.pop(name, None)
+
         await self._save_accounts()
 
         result = f"✅ 已删除账号「{name}」"
@@ -762,7 +918,7 @@ class CFQuotaPlugin(Star):
                 yield event.plain_result("❌ 请先添加 Cloudflare 账号\n使用 /cfadd 名称 AccountID ApiToken 添加")
                 return
 
-            # 解析推送时间
+            # 解析推送时间（小时）
             hours = []
             for arg in args[1:]:
                 try:
@@ -781,16 +937,20 @@ class CFQuotaPlugin(Star):
 
             await self._save_push_config()
 
+            fetch_interval = self._push_config.get("fetch_interval", 60)
             hour_strs = [f"{h:02d}:00" for h in sorted(hours)]
             result = (
-                f"✅ 定时推送已开启！\n\n"
+                f"✅ 用量监控已开启！\n\n"
+                f"  ⏱ 数据采集: 每 {fetch_interval} 分钟\n"
                 f"  ⏰ 推送时间: {', '.join(hour_strs)}\n"
-                f"  📊 推送账号: 全部账号\n"
+                f"  📊 监控账号: 全部账号\n"
                 f"  🎯 推送目标: 当前会话\n\n"
                 f"💡 其他操作:\n"
-                f"  /cfpush accounts 名称1 名称2  → 指定推送账号\n"
-                f"  /cfpush off                   → 关闭推送\n"
-                f"  /cfpush now                   → 立即推送一次"
+                f"  /cfpush interval 30|60  → 修改采集间隔\n"
+                f"  /cfpush hours 9 18      → 修改推送时间\n"
+                f"  /cfpush accounts 名称   → 指定监控账号\n"
+                f"  /cfpush off             → 关闭监控\n"
+                f"  /cfpush now             → 立即推送一次"
             )
             yield event.plain_result(result)
 
@@ -798,7 +958,41 @@ class CFQuotaPlugin(Star):
             # 关闭定时推送
             self._push_config["enabled"] = False
             await self._save_push_config()
-            yield event.plain_result("✅ 定时推送已关闭")
+            yield event.plain_result("✅ 用量监控已关闭")
+
+        elif sub_cmd == "interval":
+            # 修改数据采集间隔
+            if len(args) < 2:
+                yield event.plain_result(
+                    "⚠️ 请指定采集间隔（分钟）\n\n"
+                    "用法: /cfpush interval 30|60\n\n"
+                    "支持: 30 分钟、60 分钟\n\n"
+                    "  30 → 数据更实时，API 调用更频繁\n"
+                    "  60 → 数据较新，API 调用较少（推荐）"
+                )
+                return
+
+            try:
+                interval = int(args[1])
+            except ValueError:
+                yield event.plain_result("❌ 间隔必须是数字（30 或 60）")
+                return
+
+            if interval not in VALID_FETCH_INTERVALS:
+                yield event.plain_result(f"❌ 不支持的间隔: {interval} 分钟\n仅支持: {', '.join(str(x) for x in VALID_FETCH_INTERVALS)} 分钟")
+                return
+
+            self._push_config["fetch_interval"] = interval
+            # 如果之前未开启，自动开启
+            if not self._push_config.get("enabled"):
+                self._push_config["enabled"] = True
+                if not self._push_config.get("umo"):
+                    self._push_config["umo"] = event.unified_msg_origin
+                if not self._push_config.get("hours"):
+                    self._push_config["hours"] = [8, 20]
+
+            await self._save_push_config()
+            yield event.plain_result(f"✅ 数据采集间隔已更新: 每 {interval} 分钟")
 
         elif sub_cmd == "hours":
             # 修改推送时间
@@ -832,13 +1026,13 @@ class CFQuotaPlugin(Star):
             yield event.plain_result(f"✅ 推送时间已更新: {', '.join(hour_strs)}")
 
         elif sub_cmd == "accounts":
-            # 指定推送哪些账号
+            # 指定监控哪些账号
             account_names = args[1:]
             if not account_names:
-                # 清空 = 推送全部
+                # 清空 = 监控全部
                 self._push_config["accounts"] = []
                 await self._save_push_config()
-                yield event.plain_result("✅ 已重置为推送全部账号")
+                yield event.plain_result("✅ 已重置为监控全部账号")
                 return
 
             # 验证账号名是否存在
@@ -854,7 +1048,7 @@ class CFQuotaPlugin(Star):
             self._push_config["accounts"] = valid_names
             await self._save_push_config()
 
-            result = f"✅ 推送账号已更新: {', '.join(valid_names) if valid_names else '全部'}"
+            result = f"✅ 监控账号已更新: {', '.join(valid_names) if valid_names else '全部'}"
             if invalid:
                 result += f"\n\n⚠️ 以下账号不存在: {', '.join(invalid)}\n使用 /cflist 查看已有账号"
             yield event.plain_result(result)
@@ -867,29 +1061,87 @@ class CFQuotaPlugin(Star):
 
             # 确保有推送目标
             self._push_config["umo"] = event.unified_msg_origin
-            yield event.plain_result("🔍 正在查询额度...")
 
-            # 执行推送
-            await self._do_push()
-            # 注意：_do_push 是通过 send_message 发送的，不需要再 yield
+            # 触发一次数据采集
+            await self._fetch_all_usage()
+
+            # 直接格式化结果返回（不走 _do_push 的主动消息，避免 yield 两次的问题）
+            push_account_names = self._push_config.get("accounts", [])
+            accounts_to_push = []
+            if push_account_names:
+                for acc in self._accounts:
+                    if acc.get("name") in push_account_names:
+                        accounts_to_push.append(acc)
+            else:
+                accounts_to_push = self._accounts
+
+            all_results = []
+            for acc in accounts_to_push:
+                alias = acc.get("name", "未命名")
+                account_name = acc.get("account_name", "未知")
+                cached = self._usage_cache.get(alias)
+                if cached and cached.get("usage"):
+                    result = format_quota_text(
+                        cached.get("account_name", account_name),
+                        alias,
+                        cached["usage"],
+                        cache_time=cached.get("fetched_at", ""),
+                    )
+                    if cached.get("fetch_error"):
+                        result += f"\n\n⚠️ 上次采集出错: {cached['fetch_error']}"
+                    all_results.append(result)
+                elif cached and cached.get("fetch_error"):
+                    all_results.append(f"❌ {alias}: 采集失败 - {cached['fetch_error']}")
+                else:
+                    all_results.append(f"⚠️ {alias}: 暂无数据")
+
+            if all_results:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                header = f"⏰ CF Workers 额度推送\n🕐 {now_str}\n{'─' * 30}"
+                body = f"\n\n{'─' * 30}\n\n".join(all_results)
+                yield event.plain_result(f"{header}\n\n{body}")
+            else:
+                yield event.plain_result("⚠️ 无可推送的数据")
+
+        elif sub_cmd == "fetch":
+            # 手动触发一次数据采集
+            await self._fetch_all_usage()
+            cache_count = len(self._usage_cache)
+            if cache_count > 0:
+                lines = [f"✅ 数据采集完成，已缓存 {cache_count} 个账号的数据\n"]
+                for alias, cached in self._usage_cache.items():
+                    fetched_at = cached.get("fetched_at", "未知")
+                    error = cached.get("fetch_error")
+                    if error:
+                        lines.append(f"  • {alias}: ❌ 采集失败 - {error}")
+                    else:
+                        lines.append(f"  • {alias}: ✅ 采集于 {fetched_at}")
+                yield event.plain_result("\n".join(lines))
+            else:
+                yield event.plain_result("⚠️ 采集完成但无数据，请检查账号配置")
 
         else:
             # 未知子命令，显示帮助
             yield event.plain_result(
-                "📡 定时推送管理\n\n"
+                "📡 用量监控管理\n\n"
+                "架构: 每 30/60 分钟采集 CF 数据 → 缓存 → 到整点推送缓存数据\n\n"
                 "用法: /cfpush [子命令] [参数]\n\n"
                 "子命令:\n"
-                "  status              - 查看推送状态\n"
-                "  on [小时...]        - 开启推送（默认 8 20）\n"
-                "  off                 - 关闭推送\n"
-                "  hours 小时...       - 修改推送时间\n"
-                "  accounts 名称...    - 指定推送账号\n"
-                "  now                 - 立即推送一次\n\n"
+                "  status                 - 查看监控状态\n"
+                "  on [小时...]           - 开启监控（默认 8 20）\n"
+                "  off                    - 关闭监控\n"
+                "  interval 30|60         - 数据采集间隔（分钟）\n"
+                "  hours 小时...          - 修改推送时间\n"
+                "  accounts 名称...       - 指定监控账号\n"
+                "  now                    - 采集并立即推送一次\n"
+                "  fetch                  - 手动触发一次数据采集\n\n"
                 "示例:\n"
-                "  /cfpush on 8 20       → 每天 8:00、20:00 推送\n"
-                "  /cfpush hours 9 18    → 改为 9:00、18:00\n"
-                "  /cfpush accounts 主账号 → 只推送主账号\n"
-                "  /cfpush now           → 立即推送一次"
+                "  /cfpush on 8 20          → 每天 8:00、20:00 推送\n"
+                "  /cfpush interval 30      → 每 30 分钟采集一次数据\n"
+                "  /cfpush hours 9 18 21    → 改为 9:00、18:00、21:00 推送\n"
+                "  /cfpush accounts 主账号   → 只监控主账号\n"
+                "  /cfpush now              → 立即推送一次\n"
+                "  /cfpush fetch            → 手动采集数据"
             )
 
     @filter.command("/cfhelp")
@@ -903,15 +1155,21 @@ class CFQuotaPlugin(Star):
             "  /cflist          - 列出所有账号\n"
             "  /cfdel 名称      - 删除账号\n"
             "  /cfdefault 名称  - 设置默认账号\n"
-            "  /cfpush on [小时...] - 开启定时推送\n"
-            "  /cfpush off      - 关闭定时推送\n"
+            "  /cfpush on [小时...] - 开启用量监控\n"
+            "  /cfpush interval 30|60 - 采集间隔\n"
+            "  /cfpush off      - 关闭监控\n"
             "  /cfpush now      - 立即推送一次\n"
+            "  /cfpush fetch    - 手动采集数据\n"
             "  /cfhelp          - 显示此帮助\n\n"
+            "📡 监控架构:\n"
+            "  数据采集: 每 30/60 分钟从 CF API 拉取 → 缓存\n"
+            "  定时推送: 在自定义整点推送缓存数据\n\n"
             "📝 示例:\n"
             "  /cf额度           → 查询默认账号额度\n"
             "  /cf额度 工作账号   → 查询指定账号额度\n"
             "  /cfadd 主账号 abc123 token456\n"
-            "  /cfpush on 8 20   → 每天 8:00 和 20:00 推送\n\n"
+            "  /cfpush on 8 20   → 每天 8:00 和 20:00 推送\n"
+            "  /cfpush interval 30 → 每 30 分钟采集一次数据\n\n"
             "🔑 获取凭证:\n"
             "  • Account ID: Cloudflare Dashboard → API 区域\n"
             "  • API Token: https://dash.cloudflare.com/profile/api-tokens\n"
