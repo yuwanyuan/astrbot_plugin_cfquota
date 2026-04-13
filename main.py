@@ -18,13 +18,11 @@ AstrBot 插件：CF Workers 额度查询
 
 import asyncio
 import aiohttp
-import logging
 from datetime import datetime, timezone
 from astrbot.api.star import Context, Star, register
-from astrbot.api import filter
-from astrbot.api.event import AstrMessageEvent, MessageChain
-
-logger = logging.getLogger("astrbot_plugin_cfquota")
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.core.message.components import Plain
+from astrbot.api import logger
 
 # Cloudflare API 基地址
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
@@ -379,8 +377,11 @@ class CFQuotaPlugin(Star):
     - 手动查询：优先使用缓存，缓存过期则实时查询
     """
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
+        # 保存插件配置（AstrBot 框架实例化时传入的 AstrBotConfig 对象）
+        # Star 基类 __init__ 不会保存 config 参数，需要我们自己保存
+        self.config = config if config is not None else {}
         # 从配置读取账号数据
         self._accounts: list = []
         self._default_account: str = ""
@@ -401,6 +402,14 @@ class CFQuotaPlugin(Star):
         # 启动后台任务
         self._fetch_task = asyncio.create_task(self._fetch_loop())
         self._push_task = asyncio.create_task(self._push_loop())
+
+    async def terminate(self):
+        """插件卸载时取消后台任务"""
+        if self._fetch_task and not self._fetch_task.done():
+            self._fetch_task.cancel()
+        if self._push_task and not self._push_task.done():
+            self._push_task.cancel()
+        logger.info("CFQuotaPlugin terminated")
 
     # ============ 数据采集循环 ============
 
@@ -518,12 +527,12 @@ class CFQuotaPlugin(Star):
                     if current_minute <= 1 and current_hour in self._push_config.get("hours", []):
                         # 检查是否已经推送过（避免重复）
                         last_push_key = f"cf_last_push_{current_hour}"
-                        last_push = await self.context.get_kv_data(last_push_key)
+                        last_push = await self.get_kv_data(last_push_key, None)
                         today_str = now.strftime("%Y-%m-%d")
 
                         if last_push != today_str:
                             # 标记已推送
-                            await self.context.put_kv_data(last_push_key, today_str)
+                            await self.put_kv_data(last_push_key, today_str)
                             # 执行推送（使用缓存数据）
                             await self._do_push()
 
@@ -619,7 +628,7 @@ class CFQuotaPlugin(Star):
 
         # 发送主动消息
         try:
-            message_chain = MessageChain().message(full_message)
+            message_chain = MessageChain([Plain(full_message)])
             await self.context.send_message(umo, message_chain)
             logger.info(f"Push sent to {umo[:20]}...")
         except Exception as e:
@@ -627,28 +636,36 @@ class CFQuotaPlugin(Star):
 
     async def _save_push_config(self):
         """保存推送配置到 KV"""
-        await self.context.put_kv_data("cf_push_config", self._push_config)
+        await self.put_kv_data("cf_push_config", self._push_config)
 
     async def _load_push_config(self):
         """从 KV 加载推送配置"""
-        kv_config = await self.context.get_kv_data("cf_push_config")
+        kv_config = await self.get_kv_data("cf_push_config", None)
         if kv_config is not None and isinstance(kv_config, dict):
             self._push_config = kv_config
 
     # ============ 配置加载 ============
 
     def _load_config(self):
-        """从 AstrBot 配置加载账号数据"""
-        config = self.context.get_config()
-        if not config:
-            return
-
-        # 读取账号列表
-        accounts_data = config.get("accounts", [])
+        """从 AstrBot 配置加载账号数据
+        
+        template_list 返回格式: list[dict]，每个 dict 含 __template_key 和模板字段
+        例: [{"__template_key": "cloudflare", "name": "主账号", "account_id": "xxx", "api_token": "yyy"}]
+        """
+        # 调试：输出配置对象的类型和内容
+        if self.config:
+            logger.info(f"CFQuotaPlugin config type: {type(self.config).__name__}")
+            logger.debug(f"CFQuotaPlugin config content: {dict(self.config) if hasattr(self.config, 'items') else self.config}")
+        else:
+            logger.warning("CFQuotaPlugin config is empty! Plugin config from admin panel not loaded.")
+        
+        accounts_data = self.config.get("accounts", []) if self.config else []
+        
         if isinstance(accounts_data, list):
+            # template_list 返回的就是 list[dict]，直接使用
             self._accounts = [acc for acc in accounts_data if isinstance(acc, dict)]
         elif isinstance(accounts_data, dict):
-            # template_list 格式: {cloudflare: [{...}, {...}]}
+            # 兼容旧格式: {模板名: [条目1, 条目2]}
             for key, val in accounts_data.items():
                 if isinstance(val, list):
                     self._accounts.extend([acc for acc in val if isinstance(acc, dict)])
@@ -656,7 +673,7 @@ class CFQuotaPlugin(Star):
                     self._accounts.append(val)
 
         # 读取默认账号
-        self._default_account = config.get("default_account", "")
+        self._default_account = self.config.get("default_account", "") if self.config else ""
 
         # 如果没有默认账号但有账号，设第一个为默认
         if not self._default_account and self._accounts:
@@ -686,30 +703,30 @@ class CFQuotaPlugin(Star):
 
     async def _save_accounts(self):
         """保存账号数据到 KV 存储"""
-        await self.context.put_kv_data("cf_accounts", self._accounts)
-        await self.context.put_kv_data("cf_default_account", self._default_account)
+        await self.put_kv_data("cf_accounts", self._accounts)
+        await self.put_kv_data("cf_default_account", self._default_account)
 
     async def _load_accounts_from_kv(self):
         """从 KV 存储加载账号数据（优先级高于配置文件）"""
-        kv_accounts = await self.context.get_kv_data("cf_accounts")
+        kv_accounts = await self.get_kv_data("cf_accounts", None)
         if kv_accounts is not None:
             if isinstance(kv_accounts, list):
                 self._accounts = kv_accounts
             # KV 有数据就不再读配置文件
 
-        kv_default = await self.context.get_kv_data("cf_default_account")
+        kv_default = await self.get_kv_data("cf_default_account", None)
         if kv_default is not None and isinstance(kv_default, str):
             self._default_account = kv_default
 
     # ============ 命令处理 ============
 
-    @filter.command("/cf额度")
+    @filter.command("cf额度")
     async def query_quota(self, event: AstrMessageEvent):
         """查询 Workers 额度: /cf额度 [账号别名]"""
         await self._load_accounts_from_kv()
 
-        # 解析参数
-        args = event.message_str.strip().split()
+        # 解析参数（跳过命令名本身）
+        args = event.message_str.strip().split()[1:]
         alias = args[0] if args else ""
 
         account = self._get_account(alias)
@@ -772,12 +789,13 @@ class CFQuotaPlugin(Star):
                 logger.error(f"Failed to query quota for {alias_name}: {e}")
                 yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
-    @filter.command("/cfadd")
+    @filter.command("cfadd")
     async def add_account(self, event: AstrMessageEvent):
         """添加 Cloudflare 账号: /cfadd 名称 AccountID ApiToken"""
         await self._load_accounts_from_kv()
 
-        args = event.message_str.strip().split()
+        # 解析参数（跳过命令名本身）
+        args = event.message_str.strip().split()[1:]
         if len(args) < 3:
             yield event.plain_result(
                 "⚠️ 参数不足\n\n"
@@ -829,19 +847,20 @@ class CFQuotaPlugin(Star):
 
         yield event.plain_result(result)
 
-    @filter.command("/cflist")
+    @filter.command("cflist")
     async def list_accounts(self, event: AstrMessageEvent):
         """列出所有已添加的账号: /cflist"""
         await self._load_accounts_from_kv()
         result = format_accounts_list(self._accounts, self._default_account)
         yield event.plain_result(result)
 
-    @filter.command("/cfdel")
+    @filter.command("cfdel")
     async def delete_account(self, event: AstrMessageEvent):
         """删除指定账号: /cfdel 名称"""
         await self._load_accounts_from_kv()
 
-        args = event.message_str.strip().split()
+        # 解析参数（跳过命令名本身）
+        args = event.message_str.strip().split()[1:]
         if not args:
             yield event.plain_result("⚠️ 请指定要删除的账号名称\n\n用法: /cfdel 名称\n使用 /cflist 查看已有账号")
             return
@@ -871,12 +890,13 @@ class CFQuotaPlugin(Star):
 
         yield event.plain_result(result)
 
-    @filter.command("/cfdefault")
+    @filter.command("cfdefault")
     async def set_default_account(self, event: AstrMessageEvent):
         """设置默认账号: /cfdefault 名称"""
         await self._load_accounts_from_kv()
 
-        args = event.message_str.strip().split()
+        # 解析参数（跳过命令名本身）
+        args = event.message_str.strip().split()[1:]
         if not args:
             current = self._default_account or "未设置"
             yield event.plain_result(f"当前默认账号: {current}\n\n用法: /cfdefault 名称\n使用 /cflist 查看已有账号")
@@ -898,13 +918,14 @@ class CFQuotaPlugin(Star):
 
         yield event.plain_result(f"✅ 已将「{name}」设为默认账号\n\n使用 /cf额度 即可查询此账号的额度")
 
-    @filter.command("/cfpush")
+    @filter.command("cfpush")
     async def manage_push(self, event: AstrMessageEvent):
         """管理定时推送: /cfpush [子命令] [参数]"""
         await self._load_push_config()
         await self._load_accounts_from_kv()
 
-        args = event.message_str.strip().split()
+        # 解析参数（跳过命令名本身）
+        args = event.message_str.strip().split()[1:]
         sub_cmd = args[0].lower() if args else ""
 
         if not sub_cmd or sub_cmd == "status":
@@ -1144,7 +1165,7 @@ class CFQuotaPlugin(Star):
                 "  /cfpush fetch            → 手动采集数据"
             )
 
-    @filter.command("/cfhelp")
+    @filter.command("cfhelp")
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息: /cfhelp"""
         help_text = (
