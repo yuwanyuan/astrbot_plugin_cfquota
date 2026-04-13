@@ -218,3 +218,11 @@ astrbot_plugin_cfquota/
 ## 📜 许可证
 
 MIT
+
+---
+
+<div align="center">
+
+_🤖 本项目由 AI 辅助创建_
+
+</div>
